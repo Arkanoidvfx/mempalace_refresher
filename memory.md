@@ -9,9 +9,11 @@
 
 ## Project Files
 - `config.example.json` is the safe shared template committed with the repo.
+- `requirements.txt` currently declares `pywebview` for the desktop dashboard bootstrap.
 - `state/config.json` stores per-user project roots, thresholds, and watcher settings; it is local-only and should stay untracked.
 - `state/` stores SQLite data and runtime state.
 - `start_dashboard.cmd` launches the dashboard from the project-local `.venv`.
+- `start_dashboard.cmd` now bootstraps `requirements.txt` into the local `.venv` before launching the hidden desktop dashboard, so a fresh clone can start without manual dependency installation.
 - `start_watcher.cmd` now launches the background watcher through `pythonw.exe` and `start_watcher.vbs`, so the watcher starts hidden without leaving a console window open.
 - The service now loads config from `state/config.json` and migrates a legacy repo-root `config.json` into that path on first run.
 - Shared defaults are now machine-neutral: empty `project_roots` and `ignore_paths`, so a fresh clone starts without leaking the author's local folders.
@@ -67,6 +69,7 @@
 - A previously stale tracked project was re-baselined in the watcher DB and then scanned as `fresh` with `change_count=0` and `critical_change_count=0`.
 - Served dashboard HTML on `127.0.0.1:50874` includes `Project log` in the inspector and no longer includes `Copy log` in the per-row menu.
 - `cmd /c start_dashboard.cmd` starts the desktop dashboard without a visible console and returns immediately.
+- `cmd /c start_dashboard.cmd` still returns immediately after the bootstrap change.
 - Live API smoke check against `127.0.0.1:8787` showed 6 tracked projects, row-level project menus, parallel refresh launch, and a post-refresh scan with 6 `fresh` / 0 `needs refresh`.
 - Served dashboard HTML script passed `node --check` after fixing embedded `\\n` handling in `web.py`.
 - Served dashboard HTML script passed `node --check` after adding refresh toolbar actions.

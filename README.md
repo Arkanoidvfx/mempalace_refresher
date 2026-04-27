@@ -18,6 +18,11 @@ python -m mempalace_watcher serve
 python -m mempalace_watcher watch
 ```
 
+Windows launcher scripts:
+
+- `start_dashboard.cmd` creates `.venv` if needed and installs `requirements.txt` into that local environment before launching the desktop dashboard.
+- `start_watcher.cmd` launches the background watcher hidden and keeps using the same local `.venv`.
+
 ## Config
 
 Shared repo defaults live in `config.example.json`.
