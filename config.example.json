@@ -1,0 +1,11 @@
+{
+  "project_roots": [],
+  "ignore_paths": [],
+  "stale_threshold_hours": 24,
+  "refresh_threshold": 45,
+  "watch_interval_seconds": 300,
+  "server_host": "127.0.0.1",
+  "server_port": 8787,
+  "auto_refresh": false,
+  "refresh_timeout_seconds": 3600
+}

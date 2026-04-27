@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.tmp/
+.tmp-dashboard-script.js
+state/*.db
+state/*.sqlite3
+state/*.sqlite
+state/config.json
+state/profiles/
