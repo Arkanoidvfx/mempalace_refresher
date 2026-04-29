@@ -462,7 +462,7 @@ class WatcherTests(unittest.TestCase):
             _listener_pids(8787)
         self.assertEqual(run_mock.call_args.kwargs["creationflags"], 789)
 
-    def test_run_desktop_creates_window_without_focus(self) -> None:
+    def test_run_desktop_creates_window_with_focus(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             service = WatcherService(base)
@@ -482,7 +482,7 @@ class WatcherTests(unittest.TestCase):
             ):
                 thread_cls.return_value.start.return_value = None
                 run_desktop(service)
-            self.assertFalse(webview_mock.create_window.call_args.kwargs["focus"])
+            self.assertTrue(webview_mock.create_window.call_args.kwargs["focus"])
 
     def test_refresh_without_script_returns_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

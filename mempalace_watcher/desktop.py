@@ -153,7 +153,7 @@ def run_desktop(service: WatcherService) -> None:
         height=1024,
         min_size=(1280, 820),
         background_color="#020617",
-        focus=False,
+        focus=True,
     )
     window.events.closed += shutdown
     try:

@@ -5,6 +5,7 @@
 - Project is a local watcher for MemPalace-enabled projects.
 - Runtime design is stdlib-only Python with SQLite, a CLI, and a local dashboard.
 - Local `.venv` exists in the project root.
+- `.gitattributes` pins Python, Markdown, JSON, and text files to LF while keeping Windows launcher scripts (`.cmd`, `.vbs`) on CRLF, avoiding `core.autocrlf=true` churn.
 - Discovery tracks only real MemPalace projects under configured roots by requiring a top-level `.mempalace`, `.mempalace-data`, `.venv-mempalace`, or `scripts/mempalace_*.ps1` marker, ignores hidden `.mempalace-*` runtime directories, and does not persist the watcher repo itself.
 
 ## Project Files
@@ -22,7 +23,7 @@
 - `mempalace_watcher/windows.py` centralizes hidden Windows subprocess flags; scanner `git`, desktop `netstat` / `taskkill`, and refresh PowerShell launches now use it to avoid popping console windows when the app runs under `pythonw`.
 - `icon.ico` is the Windows app icon generated from the repo-root `icon.png`, and desktop mode passes it to `pywebview` so the WebView2 window/taskbar uses the project icon.
 - Desktop mode sets an explicit Windows AppUserModelID (`MemPalaceWatcher`) so the taskbar treats the dashboard as its own app instead of a generic Python process.
-- Desktop mode now creates the WebView window with `focus=False`, so opening the dashboard does not immediately steal the active window focus.
+- Desktop mode now creates the WebView window with `focus=True`; this avoids the Windows/WebView2 interaction bug where the dashboard can appear but text input and clicks do not behave reliably.
 - Dashboard now has explicit `Refresh selected` and `Refresh all` actions; project refresh runs `.\scripts\mempalace_refresh.ps1` from the project root.
 - `Refresh all` now operates on the already tracked project rows instead of re-running discovery synchronously first, so the button responds immediately and the UI can show local busy feedback while per-project refresh jobs start.
 - The top-level `Refresh all` button now disables itself and shows `Refreshing all...` while the request is in flight, so the user gets immediate click feedback.
@@ -70,6 +71,8 @@
 - Served dashboard HTML on `127.0.0.1:50874` includes `Project log` in the inspector and no longer includes `Copy log` in the per-row menu.
 - `cmd /c start_dashboard.cmd` starts the desktop dashboard without a visible console and returns immediately.
 - `cmd /c start_dashboard.cmd` still returns immediately after the bootstrap change.
+- `python -m unittest discover -s tests -v` passed after switching the desktop WebView window back to focused startup to restore input interaction.
+- `git diff --check` was clean after adding `.gitattributes` for stable line endings.
 - Live API smoke check against `127.0.0.1:8787` showed 6 tracked projects, row-level project menus, parallel refresh launch, and a post-refresh scan with 6 `fresh` / 0 `needs refresh`.
 - Served dashboard HTML script passed `node --check` after fixing embedded `\\n` handling in `web.py`.
 - Served dashboard HTML script passed `node --check` after adding refresh toolbar actions.
