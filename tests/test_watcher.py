@@ -12,7 +12,7 @@ from mempalace_watcher.config import AppConfig
 from mempalace_watcher.desktop import _listener_pids, run_desktop
 from mempalace_watcher.web import build_server
 from mempalace_watcher.discovery import discover_projects
-from mempalace_watcher.core import iso_now
+from mempalace_watcher.core import ScanResult, iso_now
 from mempalace_watcher.scanner import _changed_snapshot, scan_project
 from mempalace_watcher.service import WatcherService
 from mempalace_watcher.windows import hidden_subprocess_kwargs
@@ -342,6 +342,113 @@ class WatcherTests(unittest.TestCase):
             self.assertGreater(len(detail["log_lines"]), len(detail["events"]))
             self.assertIn("Recent events (newest first):", detail["log_text"])
             self.assertIn("event 9", detail["log_text"])
+            self.assertIn("---", detail["log_lines"])
+
+    def test_project_detail_indents_multiline_event_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self.make_project(base)
+            service = WatcherService(base)
+            service.save_config(AppConfig(project_roots=[tmp], ignore_paths=[]))
+            service.discover()
+            service.db.log_event(
+                path=str(root),
+                kind="refresh",
+                status="success",
+                message="first line\nWARNING: old warning\nDone",
+                duration_ms=123,
+            )
+            detail = service.project_detail(str(root))
+            self.assertIn("[refresh] success (123ms) - first line", detail["log_text"])
+            self.assertIn("  WARNING: old warning", detail["log_text"])
+
+    def test_project_detail_exposes_latest_event_log_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self.make_project(base)
+            service = WatcherService(base)
+            service.save_config(AppConfig(project_roots=[tmp], ignore_paths=[]))
+            service.discover()
+            service.db.log_event(
+                path=str(root),
+                kind="refresh",
+                status="success",
+                message="old refresh\nWARNING: stale warning",
+                duration_ms=200,
+            )
+            service.db.log_event(
+                path=str(root),
+                kind="refresh",
+                status="success",
+                message="new refresh",
+                duration_ms=100,
+            )
+            detail = service.project_detail(str(root))
+            self.assertIn("new refresh", detail["latest_event_log_text"])
+            self.assertNotIn("stale warning", detail["latest_event_log_text"])
+            self.assertIn("stale warning", detail["log_text"])
+
+    def test_project_detail_exposes_latest_refresh_separately_from_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self.make_project(base)
+            service = WatcherService(base)
+            service.save_config(AppConfig(project_roots=[tmp], ignore_paths=[]))
+            service.discover()
+            service.db.log_event(
+                path=str(root),
+                kind="refresh",
+                status="success",
+                message="refresh output",
+                duration_ms=200,
+            )
+            service.db.log_event(
+                path=str(root),
+                kind="scan",
+                status="fresh",
+                message="scan output",
+                duration_ms=None,
+            )
+            detail = service.project_detail(str(root))
+            self.assertIn("[scan] fresh", detail["latest_event_log_text"])
+            self.assertIn("[refresh] success", detail["latest_refresh_log_text"])
+            self.assertIn("refresh output", detail["latest_refresh_log_text"])
+            self.assertNotIn("scan output", detail["latest_refresh_log_text"])
+
+    def test_refresh_success_with_warning_is_marked_in_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = self.make_project(base)
+            service = WatcherService(base)
+            service.save_config(AppConfig(project_roots=[tmp], ignore_paths=[]))
+            service.discover()
+            proc = unittest.mock.MagicMock()
+            proc.stdout = iter(
+                [
+                    "Staged 1 file(s) into staging\n",
+                    "WARNING: Could not remove existing palace\n",
+                ]
+            )
+            proc.returncode = 0
+            proc.wait.return_value = 0
+            proc.kill.return_value = None
+            scan_run = unittest.mock.MagicMock(return_value=unittest.mock.MagicMock(returncode=0, stdout="", stderr=""))
+            with patch("mempalace_watcher.service.subprocess.Popen", return_value=proc), patch(
+                "mempalace_watcher.scanner.subprocess.run", scan_run
+            ):
+                result = service.refresh_project(str(root))
+            detail = service.project_detail(str(root))
+            self.assertEqual(result.reasons, ["refresh completed with warnings"])
+            self.assertTrue(detail["latest_refresh_has_warning"])
+            self.assertIn("[refresh] warning", detail["latest_refresh_log_text"])
+
+    def test_dashboard_copy_log_only_exposes_refresh_log(self) -> None:
+        from mempalace_watcher.web import PAGE
+
+        self.assertIn("Latest refresh log", PAGE)
+        self.assertIn("copySelectedProjectLog()", PAGE)
+        self.assertNotIn("Copy history", PAGE)
+        self.assertNotIn("Copy latest", PAGE)
 
     def test_resolve_powershell_prefers_pwsh_exe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -453,6 +560,7 @@ class WatcherTests(unittest.TestCase):
             ), patch("mempalace_watcher.scanner.subprocess.run", scan_run):
                 service.refresh_project(str(root))
             self.assertEqual(popen_mock.call_args.kwargs["creationflags"], 456)
+            self.assertIn("-Incremental", popen_mock.call_args.args[0])
 
     def test_listener_pids_uses_hidden_windows_launch(self) -> None:
         fake_proc = unittest.mock.MagicMock(returncode=0, stdout="", stderr="")
@@ -595,6 +703,38 @@ class WatcherTests(unittest.TestCase):
             discover.assert_not_called()
             self.assertEqual(start_refresh.call_count, 2)
 
+    def test_scan_current_projects_does_not_rediscover(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root_a = self.make_project(base, "One")
+            root_b = self.make_project(base, "Two")
+            service = WatcherService(base)
+            service.save_config(AppConfig(project_roots=[tmp], ignore_paths=[]))
+            service.discover()
+
+            def fake_scan(root: Path, name: str, **kwargs):
+                return (
+                    ScanResult(
+                        path=root,
+                        name=name,
+                        status="fresh",
+                        drift_score=0,
+                        change_count=0,
+                        critical_change_count=0,
+                        age_hours=0,
+                        reasons=["ok"],
+                    ),
+                    [],
+                )
+
+            with patch.object(service, "discover") as discover, patch(
+                "mempalace_watcher.service.scan_project", side_effect=fake_scan
+            ) as scan_run:
+                results = service._scan_projects(track_state=False, discover_before_scan=False)
+            discover.assert_not_called()
+            self.assertEqual(scan_run.call_count, 2)
+            self.assertEqual({str(result.path) for result in results}, {str(root_a), str(root_b)})
+
     def test_start_scan_sets_running_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = WatcherService(Path(tmp))
@@ -603,6 +743,16 @@ class WatcherTests(unittest.TestCase):
                 state = service.start_scan()
             self.assertTrue(state["active"])
             self.assertEqual(state["phase"], "Discovering")
+
+    def test_start_scan_current_projects_sets_scanning_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = WatcherService(Path(tmp))
+            with patch("mempalace_watcher.service.Thread.start") as thread_start:
+                thread_start.return_value = None
+                state = service.start_scan_current_projects()
+            self.assertTrue(state["active"])
+            self.assertEqual(state["phase"], "Scanning")
+            self.assertIn("current projects", state["message"])
 
 
 if __name__ == "__main__":

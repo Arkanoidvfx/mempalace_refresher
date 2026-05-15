@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from threading import Event, Lock, Thread
 import json
-import os
 import shutil
 import subprocess
 import time
@@ -11,7 +10,7 @@ import re
 import webbrowser
 
 from .config import AppConfig, load_config, save_config
-from .core import ProjectRecord, ScanResult, iso_now
+from .core import ProjectRecord, ScanResult, iso_now, normalize_path
 from .db import Database
 from .discovery import discover_projects
 from .scanner import collect_change_snapshot, scan_project
@@ -29,6 +28,10 @@ REFRESH_PROGRESS_RULES: tuple[tuple[re.Pattern[str], int, str], ...] = (
 )
 
 PROJECT_LOG_EVENT_LIMIT = 25
+REFRESH_WARNING_MARKERS = (
+    "WARNING:",
+    "Could not remove existing palace",
+)
 
 
 class WatcherService:
@@ -74,7 +77,32 @@ class WatcherService:
         return projects
 
     def _get_project_row(self, path: str):
-        return self.db.get_project(path)
+        if not path:
+            return None
+        direct = self.db.get_project(path)
+        if direct is not None:
+            return direct
+        normalized = normalize_path(path)
+        if path != normalized:
+            direct = self.db.get_project(normalized)
+            if direct is not None:
+                return direct
+        for row in self.db.list_projects():
+            if normalize_path(row["path"]) == normalized:
+                return row
+        return None
+
+    def resolve_project_path(self, path: str) -> str:
+        row = self._get_project_row(path)
+        if row is None:
+            raise FileNotFoundError(f"Project not found: {path}")
+        return str(row["path"])
+
+    def _refresh_script_path(self, row) -> Path:
+        script = Path(row["refresh_script"])
+        if script.is_absolute():
+            return script
+        return Path(row["path"]) / script
 
     def _accepted_change_snapshot(self, row) -> list[dict[str, object]] | None:
         payload = row["accepted_change_snapshot_json"]
@@ -93,7 +121,7 @@ class WatcherService:
         return accepted or None
 
     def scan(self) -> list[ScanResult]:
-        return self._scan_projects(track_state=False)
+        return self._scan_projects(track_state=False, discover_before_scan=True)
 
     def _default_scan_state(self) -> dict[str, object]:
         return {
@@ -124,13 +152,13 @@ class WatcherService:
         with self._scan_lock:
             return dict(self._scan_state)
 
-    def _scan_projects(self, *, track_state: bool) -> list[ScanResult]:
+    def _scan_projects(self, *, track_state: bool, discover_before_scan: bool) -> list[ScanResult]:
         if track_state:
             self._set_scan_state(
                 active=True,
                 done=False,
-                phase="Discovering",
-                message="Discovering tracked projects",
+                phase="Discovering" if discover_before_scan else "Scanning",
+                message="Discovering tracked projects" if discover_before_scan else "Scanning current project list",
                 percent=1,
                 total=0,
                 completed=0,
@@ -140,7 +168,8 @@ class WatcherService:
                 finished_at=None,
                 error=None,
             )
-        self.discover()
+        if discover_before_scan:
+            self.discover()
         config = self.config
         rows = list(self.db.list_projects())
         results: list[ScanResult] = []
@@ -296,6 +325,9 @@ class WatcherService:
                 return max(current_percent, percent), phase
         return current_percent, ""
 
+    def _refresh_output_has_warning(self, output: str) -> bool:
+        return any(marker in output for marker in REFRESH_WARNING_MARKERS)
+
     def _resolve_powershell(self) -> str:
         candidates = ("pwsh.exe", "pwsh", "powershell.exe", "powershell")
         for candidate in candidates:
@@ -308,6 +340,7 @@ class WatcherService:
         row = self._get_project_row(path)
         if row is None:
             raise FileNotFoundError(f"Project not found: {path}")
+        path = str(row["path"])
         config = self.config
         project_path = Path(row["path"])
         if bool(row["paused"]):
@@ -323,8 +356,7 @@ class WatcherService:
             )
             return result
 
-        script_rel = Path("scripts") / "mempalace_refresh.ps1"
-        script = project_path / script_rel
+        script = self._refresh_script_path(row)
         if not script.is_file():
             failure_reason = f"Refresh script missing: {script}"
             failed_result, _ = scan_project(
@@ -385,7 +417,7 @@ class WatcherService:
             done=False,
             percent=1,
             phase="Launching refresh",
-            message=f"Running {script_rel}",
+            message=f"Running {script}",
             started_at=refresh_started_at,
             error=None,
         )
@@ -396,7 +428,8 @@ class WatcherService:
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
-                str(script_rel),
+                str(script),
+                "-Incremental",
             ],
             cwd=str(project_path),
             stdout=subprocess.PIPE,
@@ -498,6 +531,8 @@ class WatcherService:
 
         if proc.returncode == 0:
             refresh_completed_at = iso_now()
+            refresh_had_warning = self._refresh_output_has_warning(combined_output)
+            refresh_message = "refresh completed with warnings" if refresh_had_warning else "refresh completed successfully"
             prev_count = int(row["refresh_count"] or 0)
             prev_avg = row["refresh_avg_duration_ms"]
             new_count = prev_count + 1
@@ -521,15 +556,15 @@ class WatcherService:
             fresh_result.critical_change_count = 0
             fresh_result.age_hours = 0.0
             fresh_result.error = None
-            fresh_result.reasons = ["refresh completed successfully"]
+            fresh_result.reasons = [refresh_message]
             fresh_result.changed_samples = []
             self._set_refresh_state(
                 path,
                 active=False,
                 done=True,
                 percent=100,
-                phase="Complete",
-                message="refresh completed successfully",
+                phase="Warning" if refresh_had_warning else "Complete",
+                message=refresh_message,
                 error=None,
             )
             self.db.update_refresh_state(
@@ -541,7 +576,7 @@ class WatcherService:
                 change_count=0,
                 critical_change_count=0,
                 age_hours=0.0,
-                last_reason="refresh completed successfully",
+                last_reason=refresh_message,
                 refresh_count=new_count,
                 last_refresh_duration_ms=duration_ms,
                 refresh_avg_duration_ms=new_avg,
@@ -551,8 +586,8 @@ class WatcherService:
             self.db.log_event(
                 path=path,
                 kind="refresh",
-                status="success",
-                message=(combined_output[:3000] or "refresh completed successfully"),
+                status="warning" if refresh_had_warning else "success",
+                message=(combined_output[:3000] or refresh_message),
                 duration_ms=duration_ms,
             )
             return fresh_result
@@ -599,6 +634,10 @@ class WatcherService:
         return failed_result
 
     def start_refresh_project(self, path: str, dry_run: bool = False) -> dict[str, object]:
+        row = self._get_project_row(path)
+        if row is None:
+            raise FileNotFoundError(f"Project not found: {path}")
+        path = str(row["path"])
         state = self.refresh_state(path)
         if state.get("active"):
             return state
@@ -642,7 +681,7 @@ class WatcherService:
             path = str(row["path"])
             if self.refresh_state(path).get("active"):
                 continue
-            if not Path(row["refresh_script"]).is_file():
+            if not self._refresh_script_path(row).is_file():
                 continue
             self.start_refresh_project(path, dry_run=dry_run)
             started.append(path)
@@ -656,7 +695,7 @@ class WatcherService:
             path = str(row["path"])
             if self.refresh_state(path).get("active"):
                 continue
-            if not Path(row["refresh_script"]).is_file():
+            if not self._refresh_script_path(row).is_file():
                 continue
             if (row["last_status"] or "") not in {"stale", "needs refresh", "error"}:
                 continue
@@ -670,11 +709,12 @@ class WatcherService:
         for row in self.db.list_projects():
             if row["paused"]:
                 continue
-            if self.refresh_state(str(row["path"])).get("active"):
+            path = str(row["path"])
+            if self.refresh_state(path).get("active"):
                 continue
-            if not Path(row["refresh_script"]).is_file():
+            if not self._refresh_script_path(row).is_file():
                 continue
-            refreshed.append(self.refresh_project(row["path"], dry_run=dry_run))
+            refreshed.append(self.refresh_project(path, dry_run=dry_run))
         return refreshed
 
     def refresh_stale(self) -> list[ScanResult]:
@@ -682,31 +722,38 @@ class WatcherService:
         for row in self.db.list_projects():
             if row["paused"]:
                 continue
-            if self.refresh_state(str(row["path"])).get("active"):
+            path = str(row["path"])
+            if self.refresh_state(path).get("active"):
                 continue
-            if not Path(row["refresh_script"]).is_file():
+            if not self._refresh_script_path(row).is_file():
                 continue
             if (row["last_status"] or "") not in {"stale", "needs refresh", "error"}:
                 continue
-            refreshed.append(self.refresh_project(row["path"]))
+            refreshed.append(self.refresh_project(path))
         return refreshed
 
     def rescan_all(self, apply_refresh: bool = False) -> list[ScanResult]:
-        results = self._scan_projects(track_state=False)
+        results = self._scan_projects(track_state=False, discover_before_scan=True)
         if apply_refresh:
             for result in results:
-                row = self.db.get_project(str(result.path))
+                row = self._get_project_row(str(result.path))
                 if row is None:
                     continue
                 if self.refresh_state(str(result.path)).get("active"):
                     continue
-                if not Path(row["refresh_script"]).is_file():
+                if not self._refresh_script_path(row).is_file():
                     continue
                 if result.status in {"stale", "needs refresh"} and not result.paused:
                     self.start_refresh_project(str(result.path))
         return results
 
     def start_scan(self) -> dict[str, object]:
+        return self._start_scan(discover_before_scan=True)
+
+    def start_scan_current_projects(self) -> dict[str, object]:
+        return self._start_scan(discover_before_scan=False)
+
+    def _start_scan(self, *, discover_before_scan: bool) -> dict[str, object]:
         with self._scan_lock:
             if self._scan_state.get("active"):
                 return dict(self._scan_state)
@@ -715,8 +762,8 @@ class WatcherService:
                 {
                     "active": True,
                     "done": False,
-                    "phase": "Discovering",
-                    "message": "Starting scan",
+                    "phase": "Discovering" if discover_before_scan else "Scanning",
+                    "message": "Starting project roots scan" if discover_before_scan else "Starting current projects scan",
                     "percent": 1,
                     "started_at": iso_now(),
                     "updated_at": iso_now(),
@@ -725,7 +772,7 @@ class WatcherService:
 
         def worker() -> None:
             try:
-                self._scan_projects(track_state=True)
+                self._scan_projects(track_state=True, discover_before_scan=discover_before_scan)
             except Exception as exc:  # pragma: no cover - defensive
                 self._set_scan_state(
                     active=False,
@@ -749,6 +796,7 @@ class WatcherService:
         row = self._get_project_row(path)
         if row is None:
             raise FileNotFoundError(f"Project not found: {path}")
+        path = str(row["path"])
         state = self.project_scan_state(path)
         if state.get("active"):
             return state
@@ -856,20 +904,40 @@ class WatcherService:
             lines.append("No recent events recorded.")
             return lines
         for event in events:
+            lines.append("")
+            lines.append("---")
             line = f"{event['created_at']} [{event['kind']}] {event['status']}"
             duration_ms = event.get("duration_ms")
             if duration_ms is not None:
                 line += f" ({duration_ms}ms)"
             message = str(event.get("message") or "").strip()
             if message:
-                line += f" - {message}"
+                message_lines = message.splitlines()
+                line += f" - {message_lines[0]}"
             lines.append(line)
+            if message and len(message_lines) > 1:
+                lines.extend(f"  {message_line}" for message_line in message_lines[1:])
         return lines
 
+    def _event_log_lines(self, event: dict[str, object] | None) -> list[str]:
+        if not event:
+            return ["No recent events recorded."]
+        line = f"{event['created_at']} [{event['kind']}] {event['status']}"
+        duration_ms = event.get("duration_ms")
+        if duration_ms is not None:
+            line += f" ({duration_ms}ms)"
+        message = str(event.get("message") or "").strip()
+        if not message:
+            return [line]
+        message_lines = message.splitlines()
+        line += f" - {message_lines[0]}"
+        return [line, *(f"  {message_line}" for message_line in message_lines[1:])]
+
     def project_detail(self, path: str) -> dict[str, object]:
-        row = self.db.get_project(path)
+        row = self._get_project_row(path)
         if row is None:
             raise FileNotFoundError(path)
+        path = str(row["path"])
         events = [
             {
                 "kind": item["kind"],
@@ -883,12 +951,30 @@ class WatcherService:
         detail = dict(row)
         detail["events"] = events
         detail["reasons"] = [item.strip() for item in (detail.get("last_reason") or "").split("; ") if item.strip()]
+        detail["latest_event_log_lines"] = self._event_log_lines(events[0] if events else None)
+        detail["latest_event_log_text"] = "\n".join(detail["latest_event_log_lines"])
+        latest_refresh = next((event for event in events if event["kind"] == "refresh"), None)
+        detail["latest_refresh_log_lines"] = self._event_log_lines(latest_refresh)
+        detail["latest_refresh_log_text"] = "\n".join(detail["latest_refresh_log_lines"])
+        latest_refresh_message = str(latest_refresh.get("message") or "") if latest_refresh else ""
+        latest_refresh_has_warning = bool(latest_refresh) and (
+            latest_refresh.get("status") == "warning" or self._refresh_output_has_warning(latest_refresh_message)
+        )
+        detail["latest_refresh_has_warning"] = latest_refresh_has_warning
+        detail["latest_refresh_warning"] = (
+            "Latest refresh completed with warnings. Review the latest refresh log."
+            if latest_refresh_has_warning
+            else ""
+        )
         detail["log_lines"] = self._project_log_lines(detail, events)
         detail["log_text"] = "\n".join(detail["log_lines"])
         return detail
 
     def set_paused(self, path: str, paused: bool) -> None:
-        self.db.set_paused(path, paused)
+        row = self._get_project_row(path)
+        if row is None:
+            raise FileNotFoundError(f"Project not found: {path}")
+        self.db.set_paused(str(row["path"]), paused)
 
     def update_config(self, payload: dict[str, object]) -> AppConfig:
         config = AppConfig.from_mapping(payload)

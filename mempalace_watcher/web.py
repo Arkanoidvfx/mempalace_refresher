@@ -787,9 +787,6 @@ PAGE = """<!doctype html>
         <div class="subtitle">Discovery, drift scoring, refresh control, and local visibility for every project that keeps MemPalace data.</div>
       </div>
         <div class="toolbar-stack">
-          <div class="toolbar">
-            <button class="btn primary" onclick="action('/api/actions/scan', {}, 'Rescan')">Rescan</button>
-          </div>
           <div id="actionStatus" class="action-status"></div>
       </div>
     </div>
@@ -801,6 +798,7 @@ PAGE = """<!doctype html>
             <h2>Projects</h2>
             <div class="panel-head-actions">
               <div class="note" id="scan-note">Live status updates every few seconds.</div>
+            <button class="btn" onclick="action('/api/actions/scan-current-projects', {}, 'Rescan these projects')">Rescan these projects</button>
             <button class="btn" id="refreshAllButton" onclick="refreshAllProjects(this)">Refresh all</button>
             </div>
           </div>
@@ -868,6 +866,7 @@ PAGE = """<!doctype html>
             </label>
             <div class="note">Settings are stored in state/config.json. Project tracking persists across restarts per user profile.</div>
             <div class="settings-actions">
+              <button class="btn" onclick="action('/api/actions/scan', {}, 'Rescan project roots')">Rescan project roots</button>
               <button class="btn primary" onclick="reloadConfig()">Save settings</button>
             </div>
           </div>
@@ -1181,11 +1180,20 @@ function scanMarkup(scan = {}) {
 }
 
 function applyScanState(scan) {
+  const previous = latestScanState;
   latestScanState = scan || null;
   document.body.classList.toggle('scan-active', !!scan?.active);
   const banner = document.getElementById('scanBanner');
   if (banner) {
     banner.innerHTML = scanMarkup(scan || {});
+  }
+  const wasActive = !!previous?.active;
+  const isActive = !!scan?.active;
+  if (wasActive && !isActive) {
+    loadProjects().catch(() => {});
+    if (selectedPath) {
+      selectProject(selectedPath).catch(() => {});
+    }
   }
 }
 
@@ -1388,30 +1396,17 @@ async function action(url, payload, label = 'Action') {
 
   function projectLogText(data) {
     if (!data) return '';
-    if (typeof data.log_text === 'string' && data.log_text.trim()) {
-      return data.log_text;
+    if (typeof data.latest_refresh_log_text === 'string' && data.latest_refresh_log_text.trim()) {
+      return data.latest_refresh_log_text;
     }
-    if (Array.isArray(data.log_lines) && data.log_lines.length) {
-      return data.log_lines.join('\\n');
+    if (Array.isArray(data.latest_refresh_log_lines) && data.latest_refresh_log_lines.length) {
+      return data.latest_refresh_log_lines.join('\\n');
     }
     const lines = [];
     lines.push(`Project: ${data.name || 'n/a'}`);
     lines.push(`Path: ${data.path || 'n/a'}`);
-    lines.push(`Status: ${data.last_status || data.status || 'n/a'}`);
-    lines.push(`Drift: ${data.drift_score ?? 0}`);
-    lines.push(`Age: ${fmtHours(data.age_hours ?? 0)}`);
     lines.push(`Last refresh: ${fmtTime(data.last_refresh)}`);
     lines.push(`Last refresh duration: ${fmtDurationMs(data.last_refresh_duration_ms)}`);
-    lines.push(`Predicted refresh duration: ${fmtDurationMs(data.refresh_avg_duration_ms)}`);
-    lines.push(`Refresh runs: ${data.refresh_count ?? 0}`);
-    lines.push('');
-    lines.push('Recent events:');
-    for (const event of data.events || []) {
-      const stamp = fmtTime(event.created_at);
-      const duration = event.duration_ms ? ` (${event.duration_ms}ms)` : '';
-      const message = event.message ? ` - ${event.message}` : '';
-      lines.push(`${stamp} [${event.kind}] ${event.status}${duration}${message}`);
-    }
     return lines.join('\\n');
   }
 
@@ -1456,7 +1451,7 @@ async function action(url, payload, label = 'Action') {
     }
     try {
       await copyTextToClipboard(projectLogText(selectedProjectData));
-      setProjectLogStatus('Log copied', 'ok');
+      setProjectLogStatus('Refresh log copied', 'ok');
     } catch (error) {
       setProjectLogStatus(`Copy failed: ${error.message}`, 'error');
       throw error;
@@ -1473,24 +1468,25 @@ async function action(url, payload, label = 'Action') {
   }
 
   function projectLogMarkup(data) {
-    const expanded = projectLogExpanded(data.path);
     const text = projectLogText(data);
-    const lineCount = Array.isArray(data.log_lines) ? data.log_lines.length : (text ? text.split('\\n').length : 0);
-    const buttonLabel = expanded ? 'Collapse log' : 'Expand log';
+    const lineCount = Array.isArray(data.latest_refresh_log_lines) ? data.latest_refresh_log_lines.length : (text ? text.split('\\n').length : 0);
+    const warning = data.latest_refresh_has_warning
+      ? `<div class="log-status error">${escapeHtml(data.latest_refresh_warning || 'Latest refresh completed with warnings.')}</div>`
+      : '';
     return `
       <div class="log-card">
         <div class="log-card-head">
           <div>
-            <div class="section-title">Project log</div>
-            <div class="note">${lineCount ? `${lineCount} line(s) of operational history.` : 'No project log yet.'}</div>
+            <div class="section-title">Latest refresh log</div>
+            <div class="note">${lineCount ? `${lineCount} line(s).` : 'No refresh log yet.'}</div>
           </div>
           <div class="log-actions">
-            <button class="btn" onclick="toggleProjectLog(${jsString(data.path)})">${buttonLabel}</button>
             <button class="btn primary" onclick="copySelectedProjectLog()">Copy log</button>
           </div>
         </div>
+        ${warning}
         <div id="projectLogStatus" class="log-status ${projectLogStatusState.tone}">${escapeHtml(projectLogStatusState.message || '')}</div>
-        <div class="project-log-shell ${expanded ? 'expanded' : 'collapsed'}">
+        <div class="project-log-shell expanded">
           <pre class="project-log-scroll">${escapeHtml(text || 'No project log yet.')}</pre>
         </div>
       </div>
@@ -1539,9 +1535,19 @@ async function action(url, payload, label = 'Action') {
 
 async function loadSummary() {
   const data = await requestJSON('/api/summary');
+  const prevRefreshing = latestRefreshingPaths;
+  const prevScanning = latestScanningPaths;
   latestRefreshingPaths = Array.isArray(data.refreshing_paths) ? data.refreshing_paths.map(String) : [];
   latestScanningPaths = Array.isArray(data.scanning_paths) ? data.scanning_paths.map(String) : [];
+  const finishedPerProject = (prevRefreshing.length > 0 && latestRefreshingPaths.length === 0)
+    || (prevScanning.length > 0 && latestScanningPaths.length === 0);
   applyScanState(data.scan || null);
+  if (finishedPerProject) {
+    loadProjects().catch(() => {});
+    if (selectedPath) {
+      selectProject(selectedPath).catch(() => {});
+    }
+  }
   const summary = document.getElementById('summary');
   summary.innerHTML = `
     <section class="summary-hero">
@@ -1757,14 +1763,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _read_json(self) -> dict[str, object]:
+    def _read_json(self) -> dict[str, object] | None:
         length = int(self.headers.get("Content-Length", "0"))
         if length <= 0:
             return {}
         raw = self.rfile.read(length)
         if not raw:
             return {}
-        return json.loads(raw.decode("utf-8"))
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if isinstance(payload, dict):
+            return payload
+        return None
+
+    def _require_path(self, payload: dict[str, object]) -> str | None:
+        path = payload.get("path")
+        if not isinstance(path, str):
+            return None
+        path = path.strip()
+        return path or None
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -1827,9 +1846,10 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 self._json({"error": "not found"}, status=404)
                 return
+            resolved_path = str(detail["path"])
             detail["status"] = "paused" if detail.get("paused") else (detail.get("last_status") or "fresh")
-            detail["refresh"] = self.service.refresh_state(path)
-            detail["scan"] = self.service.project_scan_state(path)
+            detail["refresh"] = self.service.refresh_state(resolved_path)
+            detail["scan"] = self.service.project_scan_state(resolved_path)
             self._json(detail)
             return
 
@@ -1842,13 +1862,27 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         payload = self._read_json()
+        if payload is None and parsed.path != "/api/actions/shutdown":
+            self._json({"error": "invalid json"}, status=400)
+            return
         if parsed.path == "/api/actions/scan":
             state = self.service.start_scan()
             self._json({"ok": True, "scan": state})
             return
+        if parsed.path == "/api/actions/scan-current-projects":
+            state = self.service.start_scan_current_projects()
+            self._json({"ok": True, "scan": state})
+            return
         if parsed.path == "/api/actions/scan-project":
-            path = str(payload.get("path", ""))
-            state = self.service.start_scan_project(path)
+            path = self._require_path(payload)
+            if not path:
+                self._json({"error": "missing path"}, status=400)
+                return
+            try:
+                state = self.service.start_scan_project(path)
+            except FileNotFoundError:
+                self._json({"error": "not found"}, status=404)
+                return
             self._json({"ok": True, "scan": state})
             return
         if parsed.path == "/api/actions/refresh-stale":
@@ -1860,23 +1894,55 @@ class Handler(BaseHTTPRequestHandler):
             self._json(state)
             return
         if parsed.path == "/api/actions/refresh":
-            path = str(payload.get("path", ""))
-            if self.service.refresh_state(path).get("active"):
-                self._json({"ok": True, "already_running": True, "refresh": self.service.refresh_state(path)})
+            path = self._require_path(payload)
+            if not path:
+                self._json({"error": "missing path"}, status=400)
                 return
-            state = self.service.start_refresh_project(path)
+            try:
+                canonical = self.service.resolve_project_path(path)
+            except FileNotFoundError:
+                self._json({"error": "not found"}, status=404)
+                return
+            running = self.service.refresh_state(canonical)
+            if running.get("active"):
+                self._json({"ok": True, "already_running": True, "refresh": running})
+                return
+            state = self.service.start_refresh_project(canonical)
             self._json({"ok": True, "queued": True, "refresh": state})
             return
         if parsed.path == "/api/actions/pause":
-            path = str(payload.get("path", ""))
+            path = self._require_path(payload)
+            if not path:
+                self._json({"error": "missing path"}, status=400)
+                return
             paused = bool(payload.get("paused", True))
-            self.service.set_paused(path, paused)
+            try:
+                canonical = self.service.resolve_project_path(path)
+            except FileNotFoundError:
+                self._json({"error": "not found"}, status=404)
+                return
+            self.service.set_paused(canonical, paused)
             self._json({"ok": True})
             return
         if parsed.path == "/api/actions/open":
-            path = str(payload.get("path", ""))
-            if path:
-                os.startfile(path)  # type: ignore[attr-defined]
+            path = self._require_path(payload)
+            if not path:
+                self._json({"error": "missing path"}, status=400)
+                return
+            try:
+                resolved = self.service.resolve_project_path(path)
+            except FileNotFoundError:
+                self._json({"error": "not found"}, status=404)
+                return
+            target = Path(resolved)
+            if not target.is_dir():
+                self._json({"error": "invalid target"}, status=400)
+                return
+            try:
+                os.startfile(str(target))  # type: ignore[attr-defined]
+            except OSError as exc:
+                self._json({"error": str(exc)}, status=500)
+                return
             self._json({"ok": True})
             return
         if parsed.path == "/api/actions/shutdown":

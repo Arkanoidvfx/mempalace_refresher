@@ -53,7 +53,7 @@ def discover_projects(config: AppConfig) -> list[ProjectRecord]:
             continue
 
         for current, dirnames, _filenames in os.walk(root):
-            current_path = Path(current)
+            current_path = Path(current).resolve()
             if _is_ignored(current_path, ignored):
                 dirnames[:] = []
                 continue
@@ -83,12 +83,13 @@ def discover_projects(config: AppConfig) -> list[ProjectRecord]:
             if normalized in seen:
                 continue
             seen.add(normalized)
+            resolved_path = current_path
             results.append(
                 ProjectRecord(
-                    path=current_path,
+                    path=resolved_path,
                     name=current_path.name,
-                    refresh_script=current_path / "scripts" / "mempalace_refresh.ps1",
-                    marker_path=_project_marker_path(current_path),
+                    refresh_script=resolved_path / "scripts" / "mempalace_refresh.ps1",
+                    marker_path=_project_marker_path(resolved_path),
                 )
             )
 

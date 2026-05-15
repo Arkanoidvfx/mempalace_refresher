@@ -6,6 +6,7 @@
 - Runtime design is stdlib-only Python with SQLite, a CLI, and a local dashboard.
 - Local `.venv` exists in the project root.
 - `.gitattributes` pins Python, Markdown, JSON, and text files to LF while keeping Windows launcher scripts (`.cmd`, `.vbs`) on CRLF, avoiding `core.autocrlf=true` churn.
+- `AGENTS.md` now captures local repo instructions: use `.venv`, read/update `memory.md`, keep dashboard refresh incremental, preserve scan/refresh UI guardrails, and keep user-specific state out of git.
 - Discovery tracks only real MemPalace projects under configured roots by requiring a top-level `.mempalace`, `.mempalace-data`, `.venv-mempalace`, or `scripts/mempalace_*.ps1` marker, ignores hidden `.mempalace-*` runtime directories, and does not persist the watcher repo itself.
 
 ## Project Files
@@ -30,6 +31,7 @@
 - Dashboard now shows visible action status for refresh/rescan/config saves instead of failing silently.
 - Toolbar is now split by responsibility: top bar keeps only `Rescan`, `Refresh all` lives in the Projects panel header, `Save settings` lives in the Settings panel, and the selected-project inspector is read-only.
 - Refresh execution resolves a real PowerShell binary via `pwsh.exe` or `powershell.exe` before launching the project script.
+- Dashboard refresh now invokes project `scripts/mempalace_refresh.ps1` with `-Incremental`, so routine Watcher refreshes do not attempt to delete a live `.mempalace\palace` ChromaDB while MCP servers are running.
 - Each successful refresh now stores per-project duration history in SQLite (`refresh_count`, `last_refresh_duration_ms`, `refresh_avg_duration_ms`) and the UI shows `Last`, `Predicted`, and `Runs` for each project.
 - Project rows and detail panels label `change_count` as `Pending` to reflect changes not yet refreshed, and scanner now reports the real post-refresh pending diff instead of zeroing it out after a successful run.
 - Project change displays now render as `N changed files` plus a separate critical-count line, instead of the ambiguous `N / M critical` format.
@@ -46,17 +48,24 @@
 - Each project row menu now exposes `Refresh memory` and `Scan changes`; the latter runs a single-project scan job and updates the pending-change counts without doing a refresh script run.
 - UI guardrails from prior regressions: do not rebuild the projects table while a row menu is open; use safe JS string escaping for Windows paths in inline handlers; keep refresh state and scan state separate so a scan action cannot masquerade as a refresh (or vice versa).
 - Dashboard polling policy now prioritizes click responsiveness: summary can update often, but the projects list refreshes only when the UI is idle and not during active pointer/focus interaction in the workspace.
+- Dashboard now reloads projects immediately on scan/refresh completion transitions (global `scan.active` true→false in `applyScanState`, and per-project `scanning_paths`/`refreshing_paths` non-empty→empty in `loadSummary`), so the projects table updates without waiting for the 4s idle tick.
 - Refresh baseline is captured at refresh completion, not start, so files written by the refresh script itself do not reappear as pending changes on the next rescan.
 - Successful refresh no longer suppresses real post-refresh drift in scanner status; if a rescan still finds changed files, the row should show the real `stale` / `needs refresh` state instead of pretending to be `fresh`.
 - Dashboard typography now uses Fira Sans / Fira Code for a more technical, dashboard-oriented look.
 - Summary area now uses a hero + metrics layout instead of a flat card strip.
 - Project rows now use a compact per-project menu with `Refresh now`, `Pause/Resume`, and `Open folder`; the selected-project panel now includes a collapsible `Project log` drawer with `Copy log` and `Collapse/Expand`.
 - Project detail responses now include canonical `log_lines` and `log_text`, and the event history window for project logs is 25 entries instead of the older 8-entry snippet.
+- Project log rendering now separates recent events with `---` and indents multiline event output, so old refresh warnings in historical logs do not look like the current refresh result.
+- Project detail responses include `latest_refresh_log_lines` / `latest_refresh_log_text`, and the dashboard now shows/copies only the latest refresh log. Historical log copy/view controls were removed to avoid mixing old warnings with the current refresh result.
+- Successful refresh runs whose output contains warning markers are logged with refresh event status `warning`; project detail exposes `latest_refresh_has_warning` / `latest_refresh_warning` so the UI can report the warning without requiring manual log inspection.
 - The dashboard HTML generator must escape JS `\n` sequences inside the embedded script; otherwise the browser receives a broken script and the page stays on the empty initial shell.
 - Rescan now runs as a background job with a live scan-state object, and the dashboard renders a compact operational scan strip plus current-row highlighting while scan is in progress.
+- Dashboard scan actions are split by scope: `Rescan project roots` lives in Settings and runs discovery across configured project roots before scanning; `Rescan these projects` lives in Projects and scans only the currently tracked/displayed project list without rediscovery.
 - The desktop dashboard uses `pywebview` with `edgechromium`, which maps to the local WebView2 runtime on Windows.
 - Scanner ignores MemPalace runtime/generated paths such as `.mempalace`, `.mempalace-data`, `.mempalace-home`, `.venv-mempalace`, `.tmp`, and `.cache` when counting drift.
 - Pending counts now compare the current dirty snapshot against `accepted_change_snapshot_json`; a successful refresh stores the current snapshot as the accepted baseline, so persistent deletions or repo migrations do not reappear after refresh.
+- Service/API hardening now normalizes project-path lookups before stateful actions (`scan`, `refresh`, `pause`, `open`) to protect against path-form mismatches and stale DB rows.
+- `/api/actions/open` now opens only tracked project directories (canonicalized through service lookup), and POST handlers now return explicit 400/404 for invalid payloads instead of implicit 500s.
 
 ## Tracked Projects
 - The author's current tracked roots remain only in local `state/config.json` and `state/mempalace_watcher.sqlite3`; they are no longer part of the shared repo defaults.
@@ -94,6 +103,10 @@
 - Served dashboard HTML script was rechecked after fixing an unescaped `\n` in `copyProjectLog`, and the live `127.0.0.1:8787` response is now script-valid again.
 - Served dashboard HTML script passed after adding background scan-state rendering and the animated scan banner.
 - `python -m py_compile ...` passed after simplifying the scan banner and fixing the successful-refresh scan baseline regression.
+- `.venv\Scripts\python.exe -m py_compile mempalace_watcher\service.py mempalace_watcher\web.py tests\test_watcher.py` and `.venv\Scripts\python.exe -m unittest discover -s tests -v` passed after splitting project-root rescan from current-project rescan.
+- `.venv\Scripts\python.exe -m py_compile mempalace_watcher\service.py tests\test_watcher.py` and `.venv\Scripts\python.exe -m unittest discover -s tests -v` passed after making dashboard refresh pass `-Incremental` to project refresh scripts.
+- `.venv\Scripts\python.exe -m py_compile mempalace_watcher\service.py tests\test_watcher.py` and `.venv\Scripts\python.exe -m unittest discover -s tests -v` passed after adding separators and indentation to project log event rendering.
+- `.venv\Scripts\python.exe -m py_compile mempalace_watcher\service.py mempalace_watcher\web.py tests\test_watcher.py` and `.venv\Scripts\python.exe -m unittest discover -s tests -v` passed after removing historical log copy/view controls and surfacing latest-refresh warning status.
 - `pywebview` was installed into the project-local `.venv` for WebView2 desktop mode.
 - Local HTTP smoke check passed against a temporary fixture project: `/api/summary` and `/api/projects` returned expected data.
 
